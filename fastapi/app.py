@@ -16,8 +16,8 @@ from pydantic import BaseModel, Field
 
 BASE_DIR = Path(__file__).resolve().parent
 
-MODEL_PATH = BASE_DIR / "xgboost_pipeline.joblib"
-ECON_PATH = BASE_DIR / "economic_indicators.csv"
+MODEL_PATH = BASE_DIR.parent / "models" / "xgboost_pipeline.joblib"
+ECON_PATH = BASE_DIR.parent / "data" / "economic_indicators.csv"
 
 
 # --------------------------------------------------
