@@ -1,371 +1,79 @@
-import re
-import joblib
-import numpy as np
-import pandas as pd
-
-from pathlib import Path
-from typing import Any
-
 from fastapi import FastAPI, HTTPException
-from pydantic import BaseModel, Field
+from pydantic import BaseModel, Field, ConfigDict
+import pandas as pd
+import joblib
+import uvicorn
+import sys
+from pathlib import Path
 
-
-# --------------------------------------------------
-# Configuration
-# --------------------------------------------------
-
-BASE_DIR = Path(__file__).resolve().parent
-
-MODEL_PATH = BASE_DIR.parent / "models" / "xgboost_pipeline.joblib"
-ECON_PATH = BASE_DIR.parent / "data" / "economic_indicators.csv"
-
-
-# --------------------------------------------------
-# Load the trained model
-# --------------------------------------------------
-
-bundle = joblib.load(MODEL_PATH)
-
-model = bundle["model"]
-numerical_cols = bundle["numerical_cols"]
-categorical_cols = bundle["categorical_cols"]
-
-feature_cols = numerical_cols + categorical_cols
-
-
-# --------------------------------------------------
-# Prepare economic indicators
-# --------------------------------------------------
-
-econ = pd.read_csv(ECON_PATH)
-
-econ.columns = (
-    econ.columns.str.lower()
-    .str.replace(" ", "_", regex=False)
-)
-
-for col in ["country", "indicator"]:
-    econ[col] = (
-        econ[col]
-        .astype("string")
-        .str.lower()
-        .str.replace(" ", "_", regex=False)
-    )
-
-year_cols = [
-    col for col in econ.columns
-    if col.startswith("yr")
-]
-
-if not year_cols:
-    raise ValueError(
-        "No economic year columns found, such as yr2022."
-    )
-
-econ_long = econ.melt(
-    id_vars=["country", "indicator"],
-    value_vars=year_cols,
-    var_name="year",
-    value_name="economic_value",
-)
-
-econ_long["year"] = (
-    econ_long["year"]
-    .str.replace("yr", "", regex=False)
-    .astype(int)
-)
-
-econ_wide = econ_long.pivot_table(
-    index=["country", "year"],
-    columns="indicator",
-    values="economic_value",
-    aggfunc="first",
-).reset_index()
-
-econ_wide.columns.name = None
-
-
-# --------------------------------------------------
-# FastAPI
-# --------------------------------------------------
 
 app = FastAPI(
-    title="Loan Prediction API",
-    description=(
-        "Predict loan outcomes from raw loan records "
-        "using XGBoost and economic indicators."
-    ),
-    version="1.0.0",
+    title="Credit Risk Assessment Engine",
+    description="Serves XGBoost default predictions on raw credit inputs utilizing custom SKLearn transformers.",
+    version="1.0.0"
 )
 
+# 1. Define the incoming raw loan request schema matching your upstream dataset structures
+class LoanRequest(BaseModel):
+    model_config = ConfigDict(populate_by_name=True)
 
-
-class LoanRecord(BaseModel):
-    # model_config = ConfigDict(extra="allow")
-
-    ID: str | None = None
-    customer_id: int | None = None
-    country_id: str
-    tbl_loan_id: int | None = None
-    lender_id: int | None = None
+    id: str = Field(..., alias="ID")
+    customer_id: int
+    country: str
+    tbl_loan_id: int
+    lender_id: int
     loan_type: str
-    Total_Amount: float
-    Total_Amount_to_Repay: float
+    total_amount: float = Field(..., alias="Total_Amount")
+    total_amount_to_repay: float = Field(..., alias="Total_Amount_to_Repay")
     disbursement_date: str
-    due_date: str | None = None
-    duration: float
-    New_versus_Repeat: str
-    Amount_Funded_By_Lender: float
-    Lender_portion_Funded: float
-    Lender_portion_to_be_repaid: float
-
-class PredictionResponse(BaseModel):
-    prediction: int = Field(
-        ...,
-        description="Predicted loan outcome (0 or 1)",
-    )
-
-    probabilities: dict[str, float] = Field(
-        ...,
-        description="Predicted probability for each target class",
-    )
-
-# --------------------------------------------------
-# Helpers
-# --------------------------------------------------
-
-def normalize_column_name(name: str) -> str:
-    """Match the column normalization used during training."""
-    return name.strip().lower().replace(" ", "_")
+    due_date: str
+    duration: int
+    new_versus_repeat: str = Field(..., alias="New_versus_Repeat")
+    amount_funded_by_lender: float = Field(..., alias="Amount_Funded_By_Lender")
+    lender_portion_funded: float = Field(..., alias="Lender_portion_Funded")
+    lender_portion_to_be_repaid: float = Field(..., alias="Lender_portion_to_be_repaid")
 
 
-def normalize_category(value: Any) -> Any:
-    """Normalize categories using the training convention."""
-    if isinstance(value, str):
-        return value.lower().replace(" ", "_")
-    return value
+# 2. Load the integrated pipeline containing the model on startup
+BASE_DIR = Path(__file__).resolve().parent.parent
+MODEL_PATH = BASE_DIR / "models" / "xgboost_pipeline.joblib"
+sys.path.insert(0, str(BASE_DIR / "notebooks"))
+from CreditFeatureExtractor import CreditFeatureExtractor
 
+try:
+    artifacts = joblib.load(MODEL_PATH)
+    model_pipeline = artifacts["model"]
+    print("Integrated modeling pipeline successfully loaded.")
+except Exception as e:
+    raise RuntimeError(f"Failed to load modeling pipeline artifact: {str(e)}")
 
-def build_features(raw: dict[str, Any]) -> pd.DataFrame:
-    """
-    Convert one raw CSV-like record into the exact
-    engineered features expected by the saved pipeline.
-    """
+@app.post("/predict")
+def predict_credit_risk(payload: LoanRequest):
+    try:
+        # Convert payload directly to a dictionary structure matching the raw schema
+        input_dict = payload.model_dump(by_alias=True)
 
-    # Normalize incoming CSV headers.
-    normalized = {
-        normalize_column_name(key): value
-        for key, value in raw.items()
-    }
+        # Convert key headers back to lowercase/snake_case to match the exact headers your Pipeline expects
+        raw_df = pd.DataFrame([input_dict])
+        raw_df.columns = raw_df.columns.str.lower().str.replace(" ", "_", regex=False)
+        # raw_df.rename(columns={'country_id': 'country'}, inplace=True)
 
-    if "target" in normalized:
-        raise HTTPException(
-            status_code=422,
-            detail="Do not include the target column in the request.",
-        )
+        # Feed the raw dataframe directly into the pipeline
+        probability_of_default = float(model_pipeline.predict_proba(raw_df)[0][1])
+        prediction = int(model_pipeline.predict(raw_df)[0])
 
-    # Required raw values for feature engineering.
-    required = [
-        "country_id",
-        "loan_type",
-        "new_versus_repeat",
-        "disbursement_date",
-        "duration",
-        "total_amount",
-        "total_amount_to_repay",
-        "amount_funded_by_lender",
-        "lender_portion_funded",
-        "lender_portion_to_be_repaid",
-    ]
-
-    missing = [
-        col for col in required
-        if col not in normalized or normalized[col] is None
-    ]
-
-    if missing:
-        raise HTTPException(
-            status_code=422,
-            detail={
-                "message": "Missing required raw fields.",
-                "missing_fields": missing,
-            },
-        )
-
-    row = pd.DataFrame([normalized])
-
-    # Convert raw dates.
-    for col in ["disbursement_date", "due_date"]:
-        if col in row.columns:
-            row[col] = pd.to_datetime(
-                row[col],
-                errors="coerce",
-            )
-
-    if pd.isna(row.loc[0, "disbursement_date"]):
-        raise HTTPException(
-            status_code=422,
-            detail="disbursement_date must be a valid date.",
-        )
-
-    # Normalize categorical values.
-    for col in [
-        "country_id",
-        "loan_type",
-        "new_versus_repeat",
-    ]:
-        row[col] = row[col].apply(normalize_category)
-
-    # Rename country_id to country, as in training.
-    row = row.rename(
-        columns={"country_id": "country"}
-    )
-
-    # Date-derived features.
-    row["loan_year"] = (
-        row["disbursement_date"].dt.year
-    )
-    row["loan_month"] = (
-        row["disbursement_date"].dt.month
-    )
-
-    # Numeric raw fields.
-    numeric_raw_cols = [
-        "duration",
-        "total_amount",
-        "total_amount_to_repay",
-        "amount_funded_by_lender",
-        "lender_portion_funded",
-        "lender_portion_to_be_repaid",
-    ]
-
-    for col in numeric_raw_cols:
-        row[col] = pd.to_numeric(
-            row[col],
-            errors="coerce",
-        )
-
-    # Financial features. Match training formulas.
-    row["interest_amount"] = (
-        row["total_amount_to_repay"]
-        - row["total_amount"]
-    )
-
-    row["repayment_ratio"] = (
-        row["total_amount_to_repay"]
-        / row["total_amount"].replace(0, np.nan)
-    )
-
-    row["duration_log"] = np.log1p(
-        row["duration"].where(row["duration"] >= 0)
-    )
-
-    row["total_amount_log"] = np.log1p(
-        row["total_amount"].where(
-            row["total_amount"] >= 0
-        )
-    )
-
-    # Merge economic indicators using country and year.
-    row = row.merge(
-        econ_wide,
-        left_on=["country", "loan_year"],
-        right_on=["country", "year"],
-        how="left",
-        validate="many_to_one",
-    )
-
-    row = row.drop(
-        columns=["year"],
-        errors="ignore",
-    )
-
-    # Check that the saved feature definitions are valid.
-    missing_model_features = [
-        col for col in feature_cols
-        if col not in row.columns
-    ]
-
-    if missing_model_features:
-        raise HTTPException(
-            status_code=500,
-            detail={
-                "message": (
-                    "Feature engineering does not match "
-                    "the saved model."
-                ),
-                "missing_model_features": missing_model_features,
-            },
-        )
-
-    # Return exactly the training feature order.
-    X = row[feature_cols].copy()
-
-    # Numeric conversion and invalid value handling.
-    for col in numerical_cols:
-        X[col] = pd.to_numeric(
-            X[col],
-            errors="coerce",
-        )
-
-    X[numerical_cols] = X[numerical_cols].replace(
-        [np.inf, -np.inf],
-        np.nan,
-    )
-
-    return X
-
-
-# --------------------------------------------------
-# Endpoints
-# --------------------------------------------------
-
-@app.get("/")
-def home():
-    return {
-        "message": "Loan Prediction API is running",
-        "docs": "/docs",
-    }
-
+        return {
+            "loan_id": payload.id,
+            "default_prediction": prediction,
+            "probability_of_default": round(probability_of_default, 4),
+            "status": "approved" if probability_of_default < 0.5 else "rejected"
+        }
+    except Exception as e:
+        raise HTTPException(status_code=400, detail=f"Prediction generation failed: {str(e)}")
 
 @app.get("/health")
-def health():
+def health_check():
     return {"status": "healthy"}
 
-
-@app.post("/predict", response_model=PredictionResponse)
-def predict(payload: LoanRecord) -> PredictionResponse:
-    """
-    Accept a single loan record in JSON format and return
-    the predicted outcome and probabilities.
-    """
-
-    # Convert Pydantic model to a dictionary
-    raw = payload.model_dump()
-
-    # Build the features expected by the trained pipeline
-    X = build_features(raw)
-
-    try:
-        prediction = int(model.predict(X)[0])
-        probabilities = model.predict_proba(X)[0]
-
-        return PredictionResponse(
-            prediction=prediction,
-            probabilities={
-                str(label): float(probability)
-                for label, probability
-                in zip(model.classes_, probabilities)
-            },
-        )
-
-    except HTTPException:
-        raise
-
-    except Exception as exc:
-        import logging
-        logging.exception("Prediction failed")
-        raise HTTPException(
-            status_code=500,
-            detail="Prediction failed. Check server logs.",
-        ) from exc
+if __name__ == '__main__':
+    uvicorn.run(app, host='0.0.0.0', port=8000)
